@@ -13,6 +13,7 @@ import {
   buildLoadedFilaments,
   computeAmsMapping,
   useFilamentMapping,
+  AS_SLICED_TRAY_ID,
 } from '../../hooks/useFilamentMapping';
 import { effectivePreferLowest } from '../../utils/amsHelpers';
 import { getColorName, setColorCatalog, __resetColorCatalogForTests } from '../../utils/colors';
@@ -1331,6 +1332,58 @@ describe('per-plate mapping vs. the whole-file union (#2551 follow-up)', () => {
     expect(plate2).toEqual([-1, 1]);
     // Plate 1 is mapped from its own (empty) override set and still gets red.
     expect(buildAmsMapping(buildFilamentComparison(PLATE_1, loaded, {}))).toEqual([0]);
+  });
+});
+
+describe('"As sliced" pick (#3460)', () => {
+  // The user pins a slot to the colour the slice asked for rather than to any
+  // tray. No tray may be consumed, the mapping must serialise the slot as
+  // -1 (which the scheduler treats as unresolved and holds), and the panel
+  // must be able to tell the pick apart from a plain mismatch.
+  const reqs = {
+    filaments: [{ slot_id: 1, type: 'PLA', color: '#FF00FF', used_grams: 10 }],
+  };
+  const printer = createPrinterStatus([
+    {
+      id: 0,
+      tray: [
+        { id: 0, tray_type: 'PLA', tray_color: 'FFFFFF' }, // white — global tray 0
+        { id: 1, tray_type: 'PLA', tray_color: '000000' }, // black — global tray 1
+      ],
+    },
+  ]);
+
+  it('reports the slot as as_sliced with no tray assigned', () => {
+    const [item] = buildFilamentComparison(reqs, buildLoadedFilaments(printer), { 1: AS_SLICED_TRAY_ID });
+    expect(item.status).toBe('as_sliced');
+    expect(item.isManual).toBe(true);
+    expect(item.loaded).toBeUndefined();
+    expect(item.hasFilament).toBe(false);
+  });
+
+  it('serialises the slot as -1 in the mapping, like any unmatched slot', () => {
+    const mapping = buildAmsMapping(buildFilamentComparison(reqs, buildLoadedFilaments(printer), { 1: AS_SLICED_TRAY_ID }));
+    expect(mapping).toEqual([-1]);
+  });
+
+  it('does not reserve a tray the other slots could use', () => {
+    const twoReqs = {
+      filaments: [
+        { slot_id: 1, type: 'PLA', color: '#FF00FF', used_grams: 10 },
+        { slot_id: 2, type: 'PLA', color: '#FFFFFF', used_grams: 10 },
+      ],
+    };
+    const mapping = buildAmsMapping(
+      buildFilamentComparison(twoReqs, buildLoadedFilaments(printer), { 1: AS_SLICED_TRAY_ID }),
+    );
+    // Slot 1 waits as sliced; slot 2 still gets the white tray.
+    expect(mapping).toEqual([-1, 0]);
+  });
+
+  it('leaves ordinary manual picks untouched', () => {
+    const [item] = buildFilamentComparison(reqs, buildLoadedFilaments(printer), { 1: 1 });
+    expect(item.status).toBe('type_only'); // black tray, magenta ask
+    expect(item.loaded?.globalTrayId).toBe(1);
   });
 });
 

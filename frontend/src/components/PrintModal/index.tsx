@@ -14,6 +14,7 @@ import {
   buildFilamentComparison,
   buildLoadedFilaments,
   useFilamentMapping,
+  AS_SLICED_TRAY_ID,
 } from '../../hooks/useFilamentMapping';
 import { useMultiPrinterFilamentMapping, type PerPrinterConfig } from '../../hooks/useMultiPrinterFilamentMapping';
 import { getColorName } from '../../utils/colors';
@@ -22,7 +23,7 @@ import { isGcodeCompatible, isPrinterCurrentlyDispatchable } from '../../utils/p
 import { getCurrencySymbol } from '../../utils/currency';
 import { getBedTypeInfo } from '../../utils/bedType';
 import { toDateTimeLocalValue, parseUTCDate } from '../../utils/date';
-import { isPlaceholderDate, effectivePreferLowest, filamentTypesCompatible } from '../../utils/amsHelpers';
+import { isPlaceholderDate, effectivePreferLowest, filamentTypesCompatible, normalizeColorForCompare } from '../../utils/amsHelpers';
 import { resolveArchiveSlicerAmsMapping } from './archiveAmsMapping';
 import { FilamentMapping } from './FilamentMapping';
 import { FilamentOverride } from './FilamentOverride';
@@ -525,6 +526,68 @@ export function PrintModal({
     [effectiveFilamentReqs, filamentOverrides],
   );
 
+  // Reopen display (#3460): a stored forced entry that restates the 3MF's own
+  // filament is the armed "As sliced" pick, not an override — hydrating it as
+  // one made the required side (and with it the queue row) read the override
+  // values as if the file had been sliced that way. Un-hydrate those so the
+  // requirement shows the 3MF's own values, and pin the sentinel so the
+  // mapping panel displays the armed pick. Re-runs are idempotent, a tray the
+  // user picked after hydration is never clobbered, and an unticked slot is
+  // left alone (the user withdrew the wait). Deliberate swaps — a stored
+  // forced entry that names a DIFFERENT filament — are untouched: they stay
+  // hydrated and displayed as the demand they became (#3133/#3445).
+  // The comparison runs against the RAW 3MF requirements
+  // (`effectiveFilamentReqs`), never `mappingFilamentReqs`: the latter folds
+  // the overrides back in, which would make the type/colour halves of
+  // `restatesSliced` pass for every stored slot and misread idx-less forced
+  // swaps as restatements.
+  useEffect(() => {
+    if (mode !== 'edit-queue-item') return;
+    const stored = queueItem?.filament_overrides;
+    if (!stored?.length) return;
+    const reqs = effectiveFilamentReqs;
+    if (!reqs?.filaments?.length) return;
+    const reqBySlot = new Map(
+      reqs.filaments.map((r) => [
+        r.slot_id,
+        // The client's FilamentRequirementsResponse type omits tray_info_idx,
+        // but the payload carries it (the matcher relies on it) — read it
+        // loosely.
+        { type: r.type, color: r.color, tray_info_idx: (r as { tray_info_idx?: string }).tray_info_idx },
+      ]),
+    );
+    const nextOverrides = { ...filamentOverrides };
+    const nextMappings = { ...manualMappings };
+    let changed = false;
+    for (const o of stored) {
+      if (!o.force_color_match) continue;
+      // The live checkbox governs: an unticked slot had its wait withdrawn.
+      if (!forceColorMatch[o.slot_id]) continue;
+      const req = reqBySlot.get(o.slot_id);
+      if (!req) continue;
+      // "Restates the slice": same type and colour, and either the same
+      // preset or none recorded (older VP jobs armed the slot without one).
+      const restatesSliced =
+        (o.type || '').toUpperCase() === (req.type || '').toUpperCase()
+        && normalizeColorForCompare(o.color) === normalizeColorForCompare(req.color)
+        && (!o.tray_info_idx || o.tray_info_idx === (req.tray_info_idx ?? ''));
+      if (!restatesSliced) continue;
+      if (manualMappings[o.slot_id] === undefined) {
+        nextMappings[o.slot_id] = AS_SLICED_TRAY_ID;
+        changed = true;
+      }
+      const cur = nextOverrides[o.slot_id];
+      if (cur && cur.type === o.type && cur.color === o.color) {
+        delete nextOverrides[o.slot_id];
+        changed = true;
+      }
+    }
+    if (changed) {
+      setFilamentOverrides(nextOverrides);
+      setManualMappings(nextMappings);
+    }
+  }, [mode, queueItem, effectiveFilamentReqs, forceColorMatch, filamentOverrides, manualMappings]);
+
   // Fetch available filaments for model-based assignment (for filament override UI)
   // Preset id -> name, to store a colour name within its product line (SN-C9)
   const filamentNameByIdx = useFilamentNameByIdx();
@@ -677,6 +740,57 @@ export function PrintModal({
   // Manual slot overrides are per plate: slot 3 of plate 1 and slot 3 of plate 2
   // are different prints and may want different trays.
   const [manualMappingsByPlate, setManualMappingsByPlate] = useState<Record<number, Record<number, number>>>({});
+
+  // Per-slot "As sliced" picks (#3460): slots armed via the dropdown row
+  // rather than a plain force tick. Only these get the sliced variant pinned
+  // into the saved override (type + colour + tray_info_idx); a plain tick
+  // keeps its pre-existing colour-only matching, unchanged from before this
+  // feature. Cleared when force is unticked, a real tray pick replaces the
+  // pick, or the model/plate selection changes. A printer switch keeps it:
+  // the demand belongs to the slice, like the force flag itself.
+  const [asSlicedPick, setAsSlicedPick] = useState<Record<number, boolean>>({});
+
+  // Toggle a slot's "Force color match" (#3460). Unticking also removes an
+  // "As sliced" pick: the sentinel mapping's whole meaning was to wait for the
+  // sliced colour, and leaving it behind would keep the slot off every tray
+  // for no stated reason.
+  const handleForceColorMatchChange = (slotId: number, value: boolean) => {
+    setForceColorMatch((prev) => ({ ...prev, [slotId]: value }));
+    if (!value) {
+      setAsSlicedPick((prev) => (prev[slotId] ? { ...prev, [slotId]: false } : prev));
+      setManualMappings((prev) => {
+        if (prev[slotId] !== AS_SLICED_TRAY_ID) return prev;
+        const next = { ...prev };
+        delete next[slotId];
+        return next;
+      });
+      setManualMappingsByPlate((prev) => {
+        let changed = false;
+        const next: Record<number, Record<number, number>> = {};
+        for (const [plateId, mappings] of Object.entries(prev)) {
+          if (mappings[slotId] === AS_SLICED_TRAY_ID) {
+            const copy = { ...mappings };
+            delete copy[slotId];
+            next[Number(plateId)] = copy;
+            changed = true;
+          } else {
+            next[Number(plateId)] = mappings;
+          }
+        }
+        return changed ? next : prev;
+      });
+    }
+  };
+
+  // The "As sliced" pick was made for this slot (#3460).
+  const handleAsSlicedPick = (slotId: number) =>
+    setAsSlicedPick((prev) => ({ ...prev, [slotId]: true }));
+
+  // A manual mapping update that replaces an "As sliced" pick with a real
+  // tray retires the pick — the tray is the slot's new alternative (#3445).
+  const retireAsSlicedPick = (slotId: number) =>
+    setAsSlicedPick((prev) => (prev[slotId] ? { ...prev, [slotId]: false } : prev));
+
   // Rack position per filament group (#1784), and one set per plate for the
   // per-plate panels — each plate has its own groups.
   const [nozzleRackChoice, setNozzleRackChoice] = useState<Record<number, number>>(() => {
@@ -846,6 +960,9 @@ export function PrintModal({
     if (mode !== 'edit-queue-item' || prevTargetModel !== null) {
       setFilamentOverrides({});
       setForceColorMatch({});
+      // "As sliced" picks are filament-scoped: a new model or plate starts
+      // the slot alternatives from scratch (#3460).
+      setAsSlicedPick({});
     }
   }, [targetModel, selectedPlate, prevTargetModel, prevPlateForOverrides, mode]);
 
@@ -1251,7 +1368,24 @@ export function PrintModal({
             // A slot left as sliced keeps its own preset; a swapped one only a stored matching one.
             const preset = variant.tray_info_idx ?? (userOverride ? undefined : req.tray_info_idx);
             const colorName = getColorName(effectiveColor, productLineOf(preset, effectiveType, filamentNameByIdx));
-            entries.push({ slot_id: req.slot_id, type: effectiveType, color: effectiveColor, color_name: colorName, ...variant, force_color_match: isForceColor });
+            // The preset goes into the entry only when the slot was armed via
+            // the "As sliced" pick (#3460): that pick means the dispatcher
+            // waits for the sliced variant too (Basic vs Matte vs Silk,
+            // #2650) — the same pin the virtual printer's queue writes. A
+            // plain force tick keeps its pre-existing colour-only matching
+            // (no idx), and a swapped slot has no sliced variant to keep; a
+            // blank one (third-party preset) stays blank so the backend's
+            // blank-idx fallback applies.
+            const pinnedIdx = variant.tray_info_idx
+              ?? (asSlicedPick[req.slot_id] && !userOverride ? req.tray_info_idx : undefined);
+            entries.push({
+              slot_id: req.slot_id,
+              type: effectiveType,
+              color: effectiveColor,
+              color_name: colorName,
+              ...(pinnedIdx ? { tray_info_idx: pinnedIdx } : {}),
+              force_color_match: isForceColor,
+            });
           }
         }
       } else {
@@ -1301,7 +1435,9 @@ export function PrintModal({
         ? plateId != null ? manualMappingsByPlate[plateId] : undefined
         : sharedMappingPrinterId === null || sharedMappingPrinterId === printerId ? manualMappings : undefined;
       const tray = picks?.[slotId];
-      if (tray == null) return undefined;
+      // #3460: the "As sliced" sentinel is not a tray. The slot keeps the
+      // sliced colour it was built with; the force flag does the waiting.
+      if (tray == null || tray === AS_SLICED_TRAY_ID) return undefined;
       const keptForced =
         storedOverrideBySlot.get(slotId)?.force_color_match === true && openedWithTray(printerId, plateId, slotId) === tray;
       return keptForced ? undefined : tray;
@@ -1796,14 +1932,17 @@ export function PrintModal({
   // Model mode has no printer and so no trays to map onto; what it offers instead
   // is the filament each slot must be printed in, which the scheduler matches
   // against whatever printer of the model it picks. Needs the model's loaded
-  // filaments to offer as alternatives.
+  // filaments to offer as alternatives — but the panel also carries the
+  // force-colour checkbox, which is meaningful with nothing loaded anywhere:
+  // "As sliced" (#3460) is how a job waits for the colours to arrive. So the
+  // gate is on having asked the model at all, not on its answer being
+  // non-empty.
   // Cross-model items have no targetModel by design — their candidates each
   // carry their own — so gate on having somewhere to source choices from.
   const showFilamentOverride =
     assignmentMode === 'model'
     && (isCrossModel || !!targetModel)
-    && !!effectiveAvailableFilaments
-    && effectiveAvailableFilaments.length > 0;
+    && !!effectiveAvailableFilaments;
 
   // Dual-nozzle gate for the Nozzle Offset Calibration toggle (#1682).
   // Mirrors backend `DUAL_NOZZLE_MODELS` so model-based assignment can show
@@ -1976,9 +2115,8 @@ export function PrintModal({
                 overrides={filamentOverrides}
                 onChange={setFilamentOverrides}
                 forceColorMatch={forceColorMatch}
-                onForceColorMatchChange={(slotId, value) =>
-                  setForceColorMatch((prev) => ({ ...prev, [slotId]: value }))
-                }
+                onForceColorMatchChange={handleForceColorMatchChange}
+                onAsSlicedPick={handleAsSlicedPick}
               />
             )}
 
@@ -2003,9 +2141,8 @@ export function PrintModal({
                   overrides={filamentOverrides}
                   onChange={setFilamentOverrides}
                   forceColorMatch={forceColorMatch}
-                  onForceColorMatchChange={(slotId, value) =>
-                    setForceColorMatch((prev) => ({ ...prev, [slotId]: value }))
-                  }
+                  onForceColorMatchChange={handleForceColorMatchChange}
+                  onAsSlicedPick={handleAsSlicedPick}
                 />
               );
             })}
@@ -2062,6 +2199,13 @@ export function PrintModal({
                   // its tray IDs belong to that printer alone (#2799).
                   setSharedMappingPrinterId(effectivePrinterId!);
                   setManualMappings(next);
+                  // A real tray pick replaces an "As sliced" pick for that
+                  // slot (#3460): the tray is the new alternative.
+                  for (const [slotId, tray] of Object.entries(next)) {
+                    if (tray !== AS_SLICED_TRAY_ID && asSlicedPick[Number(slotId)]) {
+                      retireAsSlicedPick(Number(slotId));
+                    }
+                  }
                 }}
                 onEstimatedCostChange={setEstimatedCost}
                 budgetAvailable={billingEnabled ? selectedCostCenter?.budget_available ?? null : null}
@@ -2070,9 +2214,8 @@ export function PrintModal({
                 currencySymbol={currencySymbol}
                 defaultCostPerKg={defaultCostPerKg}
                 forceColorMatch={forceColorMatch}
-                onForceColorMatchChange={(slotId, value) =>
-                  setForceColorMatch((prev) => ({ ...prev, [slotId]: value }))
-                }
+                onForceColorMatchChange={handleForceColorMatchChange}
+                onAsSlicedPick={handleAsSlicedPick}
                 archiveAmsMapping={archiveSlicerAmsMapping}
                 nozzleRackChoice={nozzleRackChoice}
                 onNozzleRackChoiceChange={setNozzleRackChoice}
@@ -2092,9 +2235,16 @@ export function PrintModal({
                   plateLabel={plate?.name || t('printModal.plateN', 'Plate {{n}}', { n: plateId })}
                   filamentReqs={plateReqs}
                   manualMappings={manualMappingsByPlate[plateId] ?? {}}
-                  onManualMappingChange={(mappings) =>
-                    setManualMappingsByPlate((prev) => ({ ...prev, [plateId]: mappings }))
-                  }
+                  onManualMappingChange={(mappings) => {
+                    setManualMappingsByPlate((prev) => ({ ...prev, [plateId]: mappings }));
+                    // A real tray pick replaces an "As sliced" pick for that
+                    // slot (#3460): the tray is the new alternative.
+                    for (const [slotId, tray] of Object.entries(mappings)) {
+                      if (tray !== AS_SLICED_TRAY_ID && asSlicedPick[Number(slotId)]) {
+                        retireAsSlicedPick(Number(slotId));
+                      }
+                    }
+                  }}
                   onEstimatedCostChange={(cost) =>
                     setEstimatedCostsByPlate((prev) => ({ ...prev, [plateId]: cost }))
                   }
@@ -2104,9 +2254,8 @@ export function PrintModal({
                   currencySymbol={currencySymbol}
                   defaultCostPerKg={defaultCostPerKg}
                   forceColorMatch={forceColorMatch}
-                  onForceColorMatchChange={(slotId, value) =>
-                    setForceColorMatch((prev) => ({ ...prev, [slotId]: value }))
-                  }
+                  onForceColorMatchChange={handleForceColorMatchChange}
+                  onAsSlicedPick={handleAsSlicedPick}
                   archiveAmsMapping={archiveSlicerAmsMapping}
                   nozzleRackChoice={nozzleRackChoiceByPlate[plateId] ?? {}}
                   onNozzleRackChoiceChange={(choice) =>

@@ -2929,7 +2929,11 @@ describe('PrintModal — override survives "Any model" -> "Specific Printer" (#3
 
     await waitFor(() => expect(patched).toHaveLength(1));
     // Not treated as a swap: the matcher still pins the Matte tray...
-    expect(patched[0].ams_mapping).toEqual([1]);
+    // The armed as-sliced state serialises the slot as unresolved: the
+    // dispatcher re-matches the forced slot against the trays it sees at
+    // dispatch (the only GFA01 tray here), so [-1] is the resolved-later
+    // form of the [1] this test used to pin.
+    expect(patched[0].ams_mapping).toEqual([-1]);
     // ...and the row keeps the pin rather than losing it on save.
     expect(patched[0].filament_overrides).toEqual([
       expect.objectContaining({ slot_id: 1, color: BROWN, tray_info_idx: 'GFA01', force_color_match: true }),
@@ -3100,8 +3104,9 @@ describe('PrintModal — a deliberate material substitution is acknowledged (#27
   };
 
   it('sends skip_filament_check when a slot is put on a tray of another material', async () => {
-    // Option 0 is the empty '-- Select slot --'; 1 is the PLA tray, 2 the PETG.
-    const saved = await pickTrayAndSave(2);
+    // Option 0 is the empty '-- Select slot --'; 1 is the "As sliced" row
+    // (#3460); 2 the PLA tray, 3 the PETG.
+    const saved = await pickTrayAndSave(3);
 
     expect(saved.ams_mapping).toEqual([1]);
     expect(saved.skip_filament_check).toBe(true);
@@ -3123,7 +3128,8 @@ describe('PrintModal — a deliberate material substitution is acknowledged (#27
   });
 
   it('sends nothing extra when the picked tray holds the material asked for', async () => {
-    const saved = await pickTrayAndSave(1);
+    // Row 1 is the "As sliced" pick (#3460); the PLA tray follows at 2.
+    const saved = await pickTrayAndSave(2);
 
     expect(saved.ams_mapping).toEqual([0]);
     expect(saved.skip_filament_check).toBeUndefined();
@@ -3475,5 +3481,525 @@ describe('PrintModal — "Force color match" on a specific printer is saved (#34
     expect(posted[0].printer_id).toBe(1);
     expect(posted[0].ams_mapping).toEqual([1]);
     expect(posted[0].filament_overrides).toEqual([expect.objectContaining(BLACK_FORCED)]);
+  });
+});
+
+describe('PrintModal — force color match "as sliced" (#3460)', () => {
+  const mockOnClose = vi.fn();
+
+  // The 3MF was sliced for brown PLA Basic — colour, variant and all. The
+  // printer has a brown and a bone-white spool loaded.
+  const PRINTERS = [
+    { id: 1, name: 'Printer 01', model: 'X1C', ip_address: '192.168.1.101', enabled: true, is_active: true },
+  ];
+  const BROWN = '#8B4513';
+  const SLOT_1_BROWN = { slot_id: 1, type: 'PLA', color: BROWN, tray_info_idx: 'GFA00', used_grams: 50 };
+
+  type Override = { slot_id: number; type: string; color: string; tray_info_idx?: string; force_color_match: boolean };
+  type Sent = { target_model?: string | null; ams_mapping?: number[] | null; filament_overrides?: Override[] | null };
+  let patched: Sent[];
+  let posted: Sent[];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    patched = [];
+    posted = [];
+    server.use(
+      http.get('/api/v1/printers/', () => HttpResponse.json(PRINTERS)),
+      http.get('/api/v1/archives/:id/plates', () => HttpResponse.json({ is_multi_plate: false, plates: [] })),
+      http.get('/api/v1/archives/:id/filament-requirements', () => HttpResponse.json({ filaments: [SLOT_1_BROWN] })),
+      http.get('/api/v1/printers/available-filaments', () =>
+        HttpResponse.json([
+          { type: 'PLA', color: BROWN, tray_info_idx: 'GFA00', tray_sub_brands: 'PLA Basic', extruder_id: null },
+          { type: 'PLA', color: '#F5F5DC', tray_info_idx: 'GFA00', tray_sub_brands: 'PLA Basic', extruder_id: null },
+        ]),
+      ),
+      http.get('/api/v1/printers/:id/status', () =>
+        HttpResponse.json({
+          connected: true,
+          state: 'IDLE',
+          ams: [
+            {
+              id: 0,
+              tray: [
+                { id: 0, tray_type: 'PLA', tray_color: '8B4513FF', tray_info_idx: 'GFA00' },
+                { id: 1, tray_type: 'PLA', tray_color: 'F5F5DCFF', tray_info_idx: 'GFA00' },
+              ],
+            },
+          ],
+          vt_tray: [],
+        }),
+      ),
+      http.get('/api/v1/printers/:id/assignments', () => HttpResponse.json([])),
+      http.patch('/api/v1/queue/:id', async ({ request }) => {
+        patched.push((await request.json()) as Sent);
+        return HttpResponse.json({ id: 1, status: 'pending' });
+      }),
+      http.post('/api/v1/queue/', async ({ request }) => {
+        posted.push((await request.json()) as Sent);
+        return HttpResponse.json({ id: 1, status: 'pending' });
+      }),
+    );
+  });
+
+  const submit = async (user: ReturnType<typeof userEvent.setup>) => {
+    await user.click(document.querySelector('button[type="submit"]') as HTMLElement);
+  };
+
+  /** The model-mode override picker: a button[role=combobox], not a <select>. */
+  const overridePicker = async () => {
+    const pickers = await screen.findAllByRole('combobox');
+    const trigger = pickers.find((el) => el.tagName === 'BUTTON');
+    if (!trigger) throw new Error('override picker not rendered');
+    return trigger;
+  };
+
+  const pickAsSliced = async (user: ReturnType<typeof userEvent.setup>, picker: HTMLElement) => {
+    await user.click(picker);
+    const listbox = await screen.findByRole('listbox');
+    const asSliced = within(listbox)
+      .getAllByRole('option')
+      .find((o) => o.getAttribute('data-value') === 'as-sliced');
+    if (!asSliced) throw new Error('as-sliced option not offered');
+    await user.click(asSliced);
+  };
+
+  it('pins the sliced variant on an "As sliced" pick in model mode', async () => {
+    const user = userEvent.setup();
+    render(<PrintModal mode="create" archiveId={1} archiveName="Job" onClose={mockOnClose} />);
+
+    await user.click(await screen.findByRole('button', { name: /any model/i }));
+    const modelSelect = await waitFor(() => {
+      const select = screen
+        .getAllByRole('combobox')
+        .find((el) => (el as HTMLSelectElement).options[0]?.value === '' && (el as HTMLSelectElement).options[0]?.text === 'Select a model...');
+      if (!select) throw new Error('target model select not rendered');
+      return select as HTMLSelectElement;
+    });
+    await user.selectOptions(modelSelect, 'X1C');
+
+    await waitFor(() => expect(screen.getByText(/Filament Override/)).toBeInTheDocument());
+    await pickAsSliced(user, await overridePicker());
+    // The pick armed the force toggle — the whole meaning of the row.
+    expect(screen.getByRole('checkbox', { name: /force color match/i })).toBeChecked();
+
+    await submit(user);
+
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0].target_model).toBe('X1C');
+    // The entry demands exactly what the slice asked for: the sliced colour
+    // AND the sliced variant (GFA00, Basic vs Matte vs Silk — #2650). The
+    // dispatcher holds the job until some printer of the model holds both.
+    expect(posted[0].filament_overrides).toEqual([
+      expect.objectContaining({ slot_id: 1, type: 'PLA', color: BROWN, tray_info_idx: 'GFA00', force_color_match: true }),
+    ]);
+  });
+
+  it('maps an "As sliced" slot to no tray and waits for the sliced colour', async () => {
+    const user = userEvent.setup();
+    const item = createMockQueueItem({ printer_id: 1, target_model: null } as Partial<PrintQueueItem>);
+    render(<PrintModal mode="edit-queue-item" archiveId={1} archiveName="Job" queueItem={item} onClose={mockOnClose} />);
+
+    await user.click(await screen.findByText(/filament mapping/i));
+    const trigger = await screen.findByRole('combobox', { name: /printer slot for/i });
+    await pickAsSliced(user, trigger);
+
+    await submit(user);
+
+    await waitFor(() => expect(patched).toHaveLength(1));
+    // No tray: the slot is unresolved in the mapping and the forced override
+    // carries the sliced colour, so dispatch holds until it is loaded.
+    expect(patched[0].ams_mapping).toEqual([-1]);
+    expect(patched[0].filament_overrides).toEqual([
+      expect.objectContaining({ slot_id: 1, type: 'PLA', color: BROWN, tray_info_idx: 'GFA00', force_color_match: true }),
+    ]);
+  });
+
+  it('unticking force returns an "As sliced" slot to its auto-match', async () => {
+    const user = userEvent.setup();
+    const item = createMockQueueItem({ printer_id: 1, target_model: null } as Partial<PrintQueueItem>);
+    render(<PrintModal mode="edit-queue-item" archiveId={1} archiveName="Job" queueItem={item} onClose={mockOnClose} />);
+
+    await user.click(await screen.findByText(/filament mapping/i));
+    const trigger = await screen.findByRole('combobox', { name: /printer slot for/i });
+    await pickAsSliced(user, trigger);
+
+    // The pick armed the toggle; taking it back must take the pick with it.
+    const forceBox = screen.getByRole('checkbox', { name: /force color match/i });
+    expect(forceBox).toBeChecked();
+    await user.click(forceBox);
+
+    await submit(user);
+
+    await waitFor(() => expect(patched).toHaveLength(1));
+    // The sentinel is gone, so the slot maps normally again (tray 0 is brown)
+    // and nothing forces a colour.
+    expect(patched[0].ams_mapping).toEqual([0]);
+    expect(patched[0].filament_overrides ?? null).toBeNull();
+  });
+
+  it('displays a reopened 2-colour as-sliced job as armed, not as auto-matched trays', async () => {
+    // The 2-colour case from the manual test: both slots armed as-sliced
+    // (red PLA + blue PETG), printer trays hold other colours. Reopening must
+    // show both slots as the armed pick — not the auto-matched trays with
+    // spurious colour-mismatch warnings, and not the stored overrides
+    // masquerading as the requirement.
+    server.use(
+      http.get('/api/v1/archives/:id/filament-requirements', () =>
+        HttpResponse.json({
+          filaments: [
+            { slot_id: 1, type: 'PLA', color: '#DE4343', tray_info_idx: 'GFA01', used_grams: 20.6 },
+            { slot_id: 5, type: 'PETG', color: '#001489', tray_info_idx: 'GFG00', used_grams: 9.7 },
+          ],
+        }),
+      ),
+      http.get('/api/v1/printers/:id/status', () =>
+        HttpResponse.json({
+          connected: true,
+          state: 'IDLE',
+          ams: [
+            { id: 0, tray: [{ id: 1, tray_type: 'PLA', tray_color: '000000FF', tray_info_idx: 'GFA01' }] },
+            { id: 1, tray: [{ id: 0, tray_type: 'PETG', tray_color: '4F2C1DFF', tray_info_idx: 'GFG00' }] },
+          ],
+          vt_tray: [],
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+    const item = createMockQueueItem({
+      printer_id: 1,
+      target_model: null,
+      ams_mapping: [-1, -1],
+      filament_overrides: [
+        { slot_id: 1, type: 'PLA', color: '#DE4343', color_name: 'Scarlet Red', tray_info_idx: 'GFA01', force_color_match: true },
+        { slot_id: 5, type: 'PETG', color: '#001489', color_name: 'Blue', tray_info_idx: 'GFG00', force_color_match: true },
+      ],
+    } as Partial<PrintQueueItem>);
+    render(<PrintModal mode="edit-queue-item" archiveId={1} archiveName="Job" queueItem={item} onClose={mockOnClose} />);
+
+    await user.click(await screen.findByText(/filament mapping/i));
+    const triggers = await waitFor(() => screen.getAllByRole('combobox', { name: /printer slot for/i }));
+    expect(triggers.length).toBe(2);
+    for (const trigger of triggers) {
+      await waitFor(() => expect(trigger.textContent).toMatch(/As sliced/i));
+    }
+    // Both force flags rehydrate ticked.
+    for (const cb of screen.getAllByRole('checkbox', { name: /force color match/i })) {
+      expect(cb).toBeChecked();
+    }
+
+    // And a no-change save keeps the stored demand, variant pins included.
+    await submit(user);
+    await waitFor(() => expect(patched).toHaveLength(1));
+    expect(patched[0].filament_overrides).toEqual([
+      expect.objectContaining({ slot_id: 1, type: 'PLA', color: '#DE4343', tray_info_idx: 'GFA01', force_color_match: true }),
+      expect.objectContaining({ slot_id: 5, type: 'PETG', color: '#001489', tray_info_idx: 'GFG00', force_color_match: true }),
+    ]);
+  });
+
+  it('preserves a model-mode forced swap across reopen and re-save', async () => {
+    // The data-loss regression the reopen-armed display once caused: a model
+    // mode ("Any model") job force-swapped to a DIFFERENT filament is stored
+    // idx-less (swaps carry no pin). Comparing the stored entry against the
+    // override-folded requirements made it read as "restating the slice" and
+    // silently reverted the swap to the 3MF's filament on reopen+save. The
+    // swap must survive untouched: it is the demand the user chose (#3133).
+    server.use(
+      http.get(
+        '/api/v1/archives/:id/filament-requirements',
+        () => HttpResponse.json({ filaments: [{ ...SLOT_1_BROWN, tray_info_idx: 'GFA00' }] }),
+      ),
+    );
+    const user = userEvent.setup();
+    const item = createMockQueueItem({
+      printer_id: null,
+      target_model: 'X1C',
+      filament_overrides: [
+        { slot_id: 1, type: 'PETG', color: '#0000FF', color_name: 'Blue', force_color_match: true },
+      ],
+    } as Partial<PrintQueueItem>);
+    render(<PrintModal mode="edit-queue-item" archiveId={1} archiveName="Job" queueItem={item} onClose={mockOnClose} />);
+
+    await waitFor(() => expect(screen.getByText(/Filament Override/)).toBeInTheDocument());
+    await submit(user);
+
+    await waitFor(() => expect(patched).toHaveLength(1));
+    expect(patched[0].target_model).toBe('X1C');
+    // The swap is the demand: still PETG blue, still forced. NOT the brown
+    // PLA the 3MF was sliced with.
+    expect(patched[0].filament_overrides).toEqual([
+      expect.objectContaining({ slot_id: 1, type: 'PETG', color: '#0000FF', force_color_match: true }),
+    ]);
+  });
+
+  it('unticking force on a reopened as-sliced job removes the armed pick', async () => {
+    // Reopen shows the armed pick (sentinel). Unticking must withdraw the
+    // wait — the sentinel stays deleted and the save carries no forced
+    // demand and no unresolved slot, instead of resurrecting the pick.
+    server.use(
+      http.get('/api/v1/printers/:id/status', () =>
+        HttpResponse.json({ connected: true, state: 'IDLE', ams: [], vt_tray: [] }),
+      ),
+    );
+    const user = userEvent.setup();
+    const item = createMockQueueItem({
+      printer_id: 1,
+      target_model: null,
+      ams_mapping: [-1],
+      filament_overrides: [
+        { slot_id: 1, type: 'PLA', color: BROWN, color_name: 'Brown', tray_info_idx: 'GFA00', force_color_match: true },
+      ],
+    } as Partial<PrintQueueItem>);
+    render(<PrintModal mode="edit-queue-item" archiveId={1} archiveName="Job" queueItem={item} onClose={mockOnClose} />);
+
+    await user.click(await screen.findByText(/filament mapping/i));
+    const forceBox = screen.getByRole('checkbox', { name: /force color match/i });
+    expect(forceBox).toBeChecked();
+    await user.click(forceBox);
+    // The armed pick is gone from the picker too.
+    expect(screen.getByRole('combobox', { name: /printer slot for/i }).textContent).not.toMatch(/As sliced/i);
+
+    await submit(user);
+
+    await waitFor(() => expect(patched).toHaveLength(1));
+    // The stored demand restated the slice, so the no-op override is dropped
+    // with the wait withdrawn — and the sentinel is not resurrected: the
+    // slot maps normally again (auto-match).
+    expect(patched[0].filament_overrides ?? null).toBeNull();
+    expect(patched[0].ams_mapping ?? null).not.toEqual([-1]);
+  });
+
+  it('re-opens a saved as-sliced job as the armed pick and re-saves it unchanged', async () => {
+    // An item queued as sliced: stored ams_mapping [-1] and a forced override
+    // carrying the sliced variant. On reopen the checkbox must come back
+    // ticked with the picker reading the as-sliced label (the -1 hydrates as
+    // "no pick", the flag as armed), and saving again must re-post the same
+    // override — variant pin included — with no tray mapping, so the job
+    // keeps waiting exactly as it was (#3460).
+    server.use(
+      http.get('/api/v1/printers/:id/status', () =>
+        HttpResponse.json({ connected: true, state: 'IDLE', ams: [], vt_tray: [] }),
+      ),
+    );
+    const user = userEvent.setup();
+    const item = createMockQueueItem({
+      printer_id: 1,
+      target_model: null,
+      ams_mapping: [-1],
+      filament_overrides: [
+        { slot_id: 1, type: 'PLA', color: BROWN, color_name: 'Brown', tray_info_idx: 'GFA00', force_color_match: true },
+      ],
+    } as Partial<PrintQueueItem>);
+    render(<PrintModal mode="edit-queue-item" archiveId={1} archiveName="Job" queueItem={item} onClose={mockOnClose} />);
+
+    await user.click(await screen.findByText(/filament mapping/i));
+    expect(screen.getByRole('checkbox', { name: /force color match/i })).toBeChecked();
+    expect(screen.getByRole('combobox', { name: /printer slot for/i }).textContent).toMatch(/As sliced/i);
+
+    await submit(user);
+
+    await waitFor(() => expect(patched).toHaveLength(1));
+    expect(patched[0].ams_mapping ?? null).toBeNull();
+    expect(patched[0].filament_overrides).toEqual([
+      expect.objectContaining({ slot_id: 1, type: 'PLA', color: BROWN, tray_info_idx: 'GFA00', force_color_match: true }),
+    ]);
+  });
+
+  it('keeps a plain force tick colour-only, without the variant pin', async () => {
+    // Pre-#3460 behaviour, deliberately unchanged: ticking "Force color
+    // match" without the As-sliced pick demands type + colour only — no
+    // tray_info_idx in the saved override. The variant pin is exclusive to
+    // the As-sliced pick, so this PR never tightens the existing checkbox.
+    const user = userEvent.setup();
+    const item = createMockQueueItem({ printer_id: 1, target_model: null } as Partial<PrintQueueItem>);
+    render(<PrintModal mode="edit-queue-item" archiveId={1} archiveName="Job" queueItem={item} onClose={mockOnClose} />);
+
+    await user.click(await screen.findByText(/filament mapping/i));
+    await user.click(screen.getByRole('checkbox', { name: /force color match/i }));
+
+    await submit(user);
+
+    await waitFor(() => expect(patched).toHaveLength(1));
+    expect(patched[0].filament_overrides).toEqual([
+      { slot_id: 1, type: 'PLA', color: BROWN, color_name: expect.any(String), force_color_match: true },
+    ]);
+  });
+
+  it('saves a custom preset idx verbatim on an as-sliced pick', async () => {
+    // A third-party slice carries a P-code preset that no Bambu spool ever
+    // reports. The saved override keeps it verbatim — the dispatcher's
+    // blank-idx fallback then decides how strictly to wait — and the frontend
+    // must neither translate it to a GFA code nor drop it (#3460).
+    server.use(
+      http.get('/api/v1/archives/:id/filament-requirements', () =>
+        HttpResponse.json({
+          filaments: [{ slot_id: 1, type: 'PLA', color: BROWN, tray_info_idx: 'P4d64437', used_grams: 50 }],
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+    const item = createMockQueueItem({ printer_id: 1, target_model: null } as Partial<PrintQueueItem>);
+    render(<PrintModal mode="edit-queue-item" archiveId={1} archiveName="Job" queueItem={item} onClose={mockOnClose} />);
+
+    await user.click(await screen.findByText(/filament mapping/i));
+    await pickAsSliced(user, await screen.findByRole('combobox', { name: /printer slot for/i }));
+
+    await submit(user);
+
+    await waitFor(() => expect(patched).toHaveLength(1));
+    expect(patched[0].filament_overrides).toEqual([
+      expect.objectContaining({ slot_id: 1, type: 'PLA', color: BROWN, tray_info_idx: 'P4d64437', force_color_match: true }),
+    ]);
+  });
+});
+
+describe('PrintModal — as-sliced on multi-plate files (#3460)', () => {
+  const mockOnClose = vi.fn();
+
+  // Plate 1 prints slot 1 (red), plate 2 prints slot 2 (blue). The printer
+  // holds a red spool and nothing else.
+  const PLATES = {
+    is_multi_plate: true,
+    plates: [
+      { index: 1, name: 'Plate 1', has_thumbnail: false, thumbnail_url: null, objects: ['A'], filaments: [{ type: 'PLA', color: '#FF0000' }], print_time_seconds: 1800, filament_used_grams: 50 },
+      { index: 2, name: 'Plate 2', has_thumbnail: false, thumbnail_url: null, objects: ['B'], filaments: [{ type: 'PLA', color: '#0000FF' }], print_time_seconds: 1800, filament_used_grams: 50 },
+    ],
+  };
+  const SLOT_1_RED = { slot_id: 1, type: 'PLA', color: '#FF0000', tray_info_idx: 'GFA00', used_grams: 50 };
+  const SLOT_2_BLUE = { slot_id: 2, type: 'PLA', color: '#0000FF', tray_info_idx: 'GFA00', used_grams: 50 };
+
+  type Queued = {
+    plate_id: number;
+    ams_mapping?: number[] | null;
+    filament_overrides?: Array<{ slot_id: number; tray_info_idx?: string; force_color_match: boolean }> | null;
+  };
+  let queued: Queued[];
+
+  const renderWithCache = (ui: React.ReactElement, prewarm?: (qc: QueryClient) => void) => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    prewarm?.(queryClient);
+    return rtlRender(
+      <QueryClientProvider client={queryClient}>
+        <BrowserRouter>
+          <AuthProvider>
+            <ThemeProvider>
+              <ToastProvider>{ui}</ToastProvider>
+            </ThemeProvider>
+          </AuthProvider>
+        </BrowserRouter>
+      </QueryClientProvider>,
+    );
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    queued = [];
+    server.use(
+      http.get('/api/v1/printers/', () =>
+        HttpResponse.json([
+          { id: 1, name: 'Printer 01', model: 'X1C', ip_address: '192.168.1.101', enabled: true, is_active: true },
+        ]),
+      ),
+      http.get('/api/v1/archives/:id/plates', () => HttpResponse.json(PLATES)),
+      http.get('/api/v1/archives/:id/filament-requirements', ({ request }) => {
+        const plateId = new URL(request.url).searchParams.get('plate_id');
+        if (plateId === '1') return HttpResponse.json({ filaments: [SLOT_1_RED] });
+        if (plateId === '2') return HttpResponse.json({ filaments: [SLOT_2_BLUE] });
+        return HttpResponse.json({ filaments: [SLOT_1_RED, SLOT_2_BLUE] });
+      }),
+      http.get('/api/v1/printers/available-filaments', () =>
+        HttpResponse.json([
+          { type: 'PLA', color: '#FF0000', tray_info_idx: 'GFA00', tray_sub_brands: 'PLA Basic', extruder_id: null },
+        ]),
+      ),
+      http.get('/api/v1/printers/:id/status', () =>
+        HttpResponse.json({
+          connected: true,
+          state: 'IDLE',
+          ams: [{ id: 0, tray: [{ id: 0, tray_type: 'PLA', tray_color: 'FF0000FF', tray_info_idx: 'GFA00' }] }],
+          vt_tray: [],
+        }),
+      ),
+      http.get('/api/v1/printers/:id/assignments', () => HttpResponse.json([])),
+      http.post('/api/v1/queue/', async ({ request }) => {
+        queued.push((await request.json()) as Queued);
+        return HttpResponse.json({ id: queued.length, status: 'pending' });
+      }),
+    );
+  });
+
+  /** Select both plates and the specific printer, open plate 1's mapping. */
+  const setupTwoPlates = async (user: ReturnType<typeof userEvent.setup>) => {
+    await waitFor(() => expect(screen.getByText('Plate 2')).toBeInTheDocument());
+    await user.click(screen.getByText('Plate 2')); // Plate 1 is auto-selected
+    await user.click(await screen.findByText('Printer 01'));
+
+    const panel = await screen.findByText(/Filament Mapping — Plate 1/);
+    await user.click(panel);
+  };
+
+  /** Pick "As sliced" in plate 1's slot picker. */
+  const pickAsSlicedOnPlate1 = async (user: ReturnType<typeof userEvent.setup>) => {
+    const picker = screen.getAllByRole('combobox', { name: /printer slot for/i })[0];
+    await user.click(picker);
+    const listbox = await screen.findByRole('listbox');
+    const row = within(listbox)
+      .getAllByRole('option')
+      .find((o) => o.getAttribute('data-value') === 'as-sliced');
+    if (!row) throw new Error('as-sliced option not offered');
+    await user.click(row);
+  };
+
+  it('queues each plate with its own as-sliced slot mapping', async () => {
+    const user = userEvent.setup();
+    renderWithCache(
+      <PrintModal mode="create" archiveId={1} archiveName="Two.gcode.3mf" onClose={mockOnClose} />,
+      (qc) => qc.setQueryData(['archive-plates', 1], PLATES),
+    );
+
+    await setupTwoPlates(user);
+    await pickAsSlicedOnPlate1(user);
+
+    await user.click(document.querySelector('button[type="submit"]') as HTMLElement);
+
+    await waitFor(() => expect(queued).toHaveLength(2));
+    const plate1 = queued.find((q) => q.plate_id === 1)!;
+    const plate2 = queued.find((q) => q.plate_id === 2)!;
+    // Plate 1 waits as sliced: no tray, forced override with the variant pin.
+    expect(plate1.ams_mapping).toEqual([-1]);
+    expect(plate1.filament_overrides).toEqual([
+      expect.objectContaining({ slot_id: 1, tray_info_idx: 'GFA00', force_color_match: true }),
+    ]);
+    // Plate 2 never picked anything: its slot auto-matches the red tray
+    // (type-only, slot 2 indexed after slot 1) and carries nothing forced.
+    expect(plate2.ams_mapping).toEqual([-1, 0]);
+    expect(plate2.filament_overrides ?? null).toBeNull();
+  });
+
+  it("unticking a plate's force returns its as-sliced slot to the auto-match", async () => {
+    const user = userEvent.setup();
+    renderWithCache(
+      <PrintModal mode="create" archiveId={1} archiveName="Two.gcode.3mf" onClose={mockOnClose} />,
+      (qc) => qc.setQueryData(['archive-plates', 1], PLATES),
+    );
+
+    await setupTwoPlates(user);
+    await pickAsSlicedOnPlate1(user);
+
+    // The pick armed plate 1's checkbox; taking it back must sweep the
+    // sentinel out of that plate's mapping — not leave it unmapped for no
+    // reason.
+    const forceBoxes = screen.getAllByRole('checkbox', { name: /force color match/i });
+    await user.click(forceBoxes[0]);
+
+    await user.click(document.querySelector('button[type="submit"]') as HTMLElement);
+
+    await waitFor(() => expect(queued).toHaveLength(2));
+    const plate1 = queued.find((q) => q.plate_id === 1)!;
+    // The sentinel is gone: slot 1 maps to the red tray like any other slot.
+    expect(plate1.ams_mapping).toEqual([0]);
+    expect(plate1.filament_overrides ?? null).toBeNull();
   });
 });

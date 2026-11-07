@@ -19,6 +19,21 @@ import type { PrinterStatus, SlotSpoolIdentity } from '../api/client';
 export type SlotSpoolIdentities = Map<number, SlotSpoolIdentity>;
 
 /**
+ * Sentinel "tray id" for the "As sliced" pick in the mapping panel (#3460):
+ * the slot is not pointed at any tray at all — the job must wait until some
+ * tray holds the colour the slice asked for, which the dispatcher's
+ * force-color-match logic enforces from the saved override. Chosen to collide
+ * with no real tray id (external spools are 254/255, unresolved is -1) and it
+ * never reaches the backend: `buildAmsMapping` serialises the slot as -1.
+ */
+export const AS_SLICED_TRAY_ID = -2;
+
+/** Dropdown value of the "As sliced" row in both slot pickers (#3460).
+ *  Distinct from '' (which clears the pick back to auto-match) and from any
+ *  tray id string. Lives here so the two pickers and the tests cannot drift. */
+export const AS_SLICED_VALUE = 'as-sliced';
+
+/**
  * Name a slot after the spool bound to it, the way the printer card does.
  *
  * Telemetry can only ever say "PLA" plus a colour hex for anything that isn't
@@ -225,9 +240,11 @@ export interface FilamentRequirement {
 }
 
 /**
- * Status of filament comparison between required and loaded.
+ * Status of filament comparison between required and loaded filaments.
+ * `as_sliced` is the user's explicit "As sliced" pick (#3460): no tray is
+ * assigned and the job waits for the sliced colour instead.
  */
-export type FilamentStatus = 'match' | 'type_only' | 'mismatch' | 'empty';
+export type FilamentStatus = 'match' | 'type_only' | 'mismatch' | 'empty' | 'as_sliced';
 
 /**
  * Result of comparing a required filament with loaded filaments.
@@ -321,6 +338,23 @@ export function buildFilamentComparison(
     // Check if there's a manual override for this slot
     if (slotId > 0 && manualMappings[slotId] !== undefined) {
       const manualTrayId = manualMappings[slotId];
+
+      // #3460: "As sliced" pins the slot to the colour the slice asked for
+      // rather than to any tray. No tray is consumed and none is reported, so
+      // the mapping serialises this slot as -1 and the dispatcher's
+      // force-color-match logic holds the job until the colour turns up.
+      if (manualTrayId === AS_SLICED_TRAY_ID) {
+        return {
+          ...req,
+          loaded: undefined,
+          hasFilament: false,
+          typeMatch: false,
+          colorMatch: false,
+          status: 'as_sliced',
+          isManual: true,
+        };
+      }
+
       const manualLoaded = loadedFilaments.find((f) => f.globalTrayId === manualTrayId);
 
       if (manualLoaded) {

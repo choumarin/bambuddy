@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Circle, Check, AlertTriangle, RefreshCw, ChevronDown, ChevronUp, Palette } from 'lucide-react';
+import { Palette, RefreshCw, ChevronDown, ChevronUp, Circle, Check, AlertTriangle } from 'lucide-react';
 import { api } from '../../api/client';
 import type { SlotSpoolIdentity } from '../../api/client';
-import { useFilamentMapping } from '../../hooks/useFilamentMapping';
+import { useFilamentMapping, AS_SLICED_TRAY_ID, AS_SLICED_VALUE } from '../../hooks/useFilamentMapping';
 import { effectivePreferLowest, FTS_INLET_SIDE, normalizeColorForCompare } from '../../utils/amsHelpers';
 import { disambiguateColorNames, getColorName } from '../../utils/colors';
 import { SlotPicker } from './SlotPicker';
@@ -31,6 +31,7 @@ export function FilamentMapping({
   defaultExpanded = false,
   forceColorMatch,
   onForceColorMatchChange,
+  onAsSlicedPick,
   plateLabel,
   archiveAmsMapping,
   nozzleRackChoice,
@@ -298,15 +299,28 @@ export function FilamentMapping({
   }
 
   // Determine status indicator color
+  // A slot pinned to "As sliced" will hold the whole job until its colour is
+  // loaded — the opposite of ready, so the summary must not claim it (#3460).
+  const hasAsSliced = filamentComparison.some((f) => f.status === 'as_sliced');
+
   const statusColor = hasTypeMismatch
     ? '#f97316' // orange
     : hasColorMismatch
     ? '#facc15' // yellow
+    : hasAsSliced
+    ? '#3b82f6' // blue
     : '#00ae42'; // green
 
   const handleSlotChange = (slotId: number, value: string) => {
     if (slotId > 0) {
-      if (value === '') {
+      if (value === AS_SLICED_VALUE) {
+        // "As sliced" (#3460) is not a tray: record the sentinel so the slot
+        // maps to nothing and the panel shows the pick, and arm the force
+        // toggle — its whole meaning is "wait for the sliced colour".
+        onManualMappingChange({ ...manualMappings, [slotId]: AS_SLICED_TRAY_ID });
+        onForceColorMatchChange?.(slotId, true);
+        onAsSlicedPick?.(slotId);
+      } else if (value === '') {
         // Clear manual override
         const next = { ...manualMappings };
         delete next[slotId];
@@ -346,6 +360,8 @@ export function FilamentMapping({
           <span className="text-xs text-orange-700 dark:text-orange-400">({t('printModal.statusTypeNotFound')})</span>
         ) : hasColorMismatch ? (
           <span className="text-xs text-yellow-700 dark:text-yellow-400">({t('printModal.statusColorMismatch')})</span>
+        ) : hasAsSliced ? (
+          <span className="text-xs text-blue-700 dark:text-blue-400">({t('printModal.statusAsSliced')})</span>
         ) : (
           <span className="text-xs text-bambu-green">({t('printModal.statusReady')})</span>
         )}
@@ -404,6 +420,22 @@ export function FilamentMapping({
             // array shape; defensive fallback covers the empty-reqs render
             // path that shouldn't reach here anyway.
             const { resolvedName, colorLabel } = filamentLabels[idx] ?? { resolvedName: item.type, colorLabel: getColorName(item.color) };
+            // #3460: has this slot been pinned to "As sliced"? The sentinel in
+            // `manualMappings` is the pick; the comparison then reports
+            // `as_sliced` and no tray.
+            const asSliced = manualMappings[slotId] === AS_SLICED_TRAY_ID;
+            // #3460: with force armed, no pick made, and no tray displayed,
+            // the slot IS the as-sliced state — the placeholder row says so,
+            // and the option row stands down so the choice is never offered
+            // twice. When a tray IS displayed (auto-matched or picked by
+            // hand), the option row stays offered: it is the only way back to
+            // the sliced colour, and the placeholder is not rendered anyway.
+            const asSlicedPlaceholderShown =
+              canForceMatch
+              && !asSliced
+              && !item.isManual
+              && (forceColorMatch?.[slotId] ?? false)
+              && item.loaded?.globalTrayId == null;
             // Both sides of a colour mismatch routinely resolve to the same
             // name -- a slicer's pure blue and a spool's navy are both "Blue" --
             // which made the warning look like it was contradicting itself
@@ -503,10 +535,31 @@ export function FilamentMapping({
                   rejects the ams_mapping at start-print -- failure is loud,
                   not silent.
                 */}
+                {/* An armed force toggle with no tray displayed IS the "as
+                    sliced" state (#3445 semantics): the placeholder row says
+                    so instead of a bare "-- Select slot --" that reads like
+                    nothing was decided while the job will in fact wait for
+                    the sliced colour (#3460). The option row stands down in
+                    exactly that state, so the list never offers the choice
+                    twice. When a tray IS displayed (auto-matched or picked),
+                    the option stays offered — it is the way back to the
+                    sliced colour — and a manual pick whose tray went
+                    unreadable (printer off, tray emptied) keeps the plain
+                    placeholder: the save path drops that slot's forced entry
+                    exactly then (#3445), so as-sliced would over-promise. */}
                 <SlotPicker
-                  value={item.loaded?.globalTrayId != null ? String(item.loaded.globalTrayId) : ''}
+                  value={asSliced ? AS_SLICED_VALUE : item.loaded?.globalTrayId != null ? String(item.loaded.globalTrayId) : ''}
                   onChange={(next) => handleSlotChange(slotId, next)}
-                  placeholder={`-- ${t('printModal.selectSlot')} --`}
+                  placeholder={
+                    asSlicedPlaceholderShown
+                      ? t('printModal.asSliced', { name: resolvedName, color: colorLabel })
+                      : `-- ${t('printModal.selectSlot')} --`
+                  }
+                  placeholderOption={
+                    asSlicedPlaceholderShown
+                      ? { rgba: item.color }
+                      : undefined
+                  }
                   ariaLabel={t('printModal.slotForFilament', { name: resolvedName })}
                   exactMatchLabel={t('printModal.exactColorMatch')}
                   className={`${
@@ -514,10 +567,30 @@ export function FilamentMapping({
                       ? 'border-bambu-green/50 text-bambu-green'
                       : item.status === 'type_only'
                       ? 'border-yellow-500 dark:border-yellow-400/50 text-yellow-700 dark:text-yellow-400'
+                      : item.status === 'as_sliced'
+                      ? 'border-blue-500/50 dark:border-blue-400/50 text-blue-700 dark:text-blue-400'
                       : 'border-orange-500 dark:border-orange-400/50 text-orange-700 dark:text-orange-400'
                   } ${item.isManual ? 'ring-1 ring-blue-400/50' : ''}`}
                   title={item.isManual ? t('printModal.manuallySelected') : t('printModal.autoMatched')}
-                  options={loadedFilaments.map((f) => {
+                  options={[
+                    // #3460: the sliced file's own colour, offered ahead of the
+                    // printer's trays. Picking it pins the slot to the sliced
+                    // colour and arms "Force color match", so dispatch waits
+                    // until some tray actually holds it. Only offered when the
+                    // caller persists force flags — without one the pick could
+                    // not say what it means — and hidden while the slot already
+                    // IS the as-sliced pick (force armed, nothing picked), where
+                    // the placeholder row reads the same and a second row would
+                    // look like a second choice.
+                    ...(canForceMatch && !asSlicedPlaceholderShown
+                      ? [{
+                          value: AS_SLICED_VALUE,
+                          label: t('printModal.asSliced', { name: resolvedName, color: colorLabel }),
+                          rgba: item.color,
+                          exactMatch: true,
+                        }]
+                      : []),
+                    ...loadedFilaments.map((f) => {
                       const remainingWeight = trayRemainingWeightMap.get(f.globalTrayId);
                       const remainingLabel = remainingWeight != null
                         ? t('printModal.slotRemainingShort', {
@@ -550,11 +623,16 @@ export function FilamentMapping({
                           normalizeColorForCompare(item.color) !== '' &&
                           normalizeColorForCompare(f.color) === normalizeColorForCompare(item.color),
                       };
-                  })}
+                  })
+                ]}
                 />
                 {/* Status icon */}
                 {item.status === 'match' ? (
                   <Check className="w-3 h-3 text-bambu-green" />
+                ) : item.status === 'as_sliced' ? (
+                  <span title={t('printModal.asSlicedTooltip')}>
+                    <Palette className="w-3 h-3 text-blue-500 dark:text-blue-400" />
+                  </span>
                 ) : item.status === 'type_only' ? (
                   <span
                     title={

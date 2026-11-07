@@ -30,6 +30,8 @@ vi.mock('@tanstack/react-query', () => ({
 vi.mock('../../api/client', () => ({ api: { getPrinterStatus: vi.fn() } }));
 
 const { useMultiPrinterFilamentMapping } = await import('../../hooks/useMultiPrinterFilamentMapping');
+// Type-only imports from api/client, so this is safe to import statically.
+const { AS_SLICED_TRAY_ID } = await import('../../hooks/useFilamentMapping');
 
 const status = (trays: { type: string; color: string }[]): PrinterStatus =>
   ({
@@ -154,5 +156,23 @@ describe('useMultiPrinterFilamentMapping — per-printer mapping (#2799)', () =>
     expect(p2s5.matchStatus).toBe('missing');
     expect(result.current.allPrintersReady).toBe(false);
     expect(result.current.getFinalMapping(10)?.[2]).toBe(-1);
+  });
+});
+
+describe('useMultiPrinterFilamentMapping — the "As sliced" sentinel (#3460)', () => {
+  it('serialises an as-sliced pick as -1, never as the sentinel itself', () => {
+    // A slot pinned to "As sliced" names no tray. If the raw sentinel value
+    // (-2) ever reached a final mapping it would be submitted to the backend,
+    // which only knows tray ids and -1. Authored on P2S-4, so only P2S-4
+    // receives it — same rule as a tray pick (#2799).
+    const { result } = render([9, 10], { 1: AS_SLICED_TRAY_ID }, 9);
+
+    const p2s4 = result.current.getFinalMapping(9);
+    expect(p2s4?.[0]).toBe(-1);
+    expect(JSON.stringify(p2s4)).not.toContain('-2');
+    // The other slots still map normally against P2S-4's own trays.
+    expect(p2s4).toEqual([-1, -1, 1]);
+    // P2S-5 never saw the pick at all.
+    expect(result.current.getFinalMapping(10)).toEqual([0, -1, 2]);
   });
 });

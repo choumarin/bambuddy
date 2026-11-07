@@ -236,6 +236,222 @@ describe('FilamentMapping — FTS routing', () => {
     expect(screen.queryByLabelText(/Force color match/i)).not.toBeInTheDocument();
   });
 
+  it('offers "As sliced" and pins it to the force toggle (#3460)', async () => {
+    // The dropdown used to list only the printer's current trays, so there was
+    // no way to say "wait for the colour the slice asked for" from the picker.
+    // The option must sit ahead of the trays, record the sentinel mapping, and
+    // arm the force-colour toggle that makes dispatch wait.
+    server.use(
+      http.get('/api/v1/printers/:id/status', () => HttpResponse.json(createStatus({}))),
+    );
+
+    const onManualMappingChange = vi.fn();
+    const onForceColorMatchChange = vi.fn();
+    render(
+      <FilamentMapping
+        printerId={1}
+        filamentReqs={{
+          filaments: [
+            // Magenta ask: matches no loaded tray, which is the point.
+            { slot_id: 1, type: 'PLA', color: '#FF00FF', used_grams: 25, used_meters: 8.5 },
+          ],
+        }}
+        manualMappings={{}}
+        onManualMappingChange={onManualMappingChange}
+        currencySymbol="$"
+        defaultCostPerKg={0}
+        defaultExpanded
+        forceColorMatch={{}}
+        onForceColorMatchChange={onForceColorMatchChange}
+      />,
+    );
+
+    const listbox = await openSlotPicker();
+    const asSliced = within(listbox).getByText(/As sliced/i);
+    expect(within(listbox).getAllByRole('option').length).toBeGreaterThan(1);
+    expect(asSliced.textContent).toMatch(/PLA/);
+
+    fireEvent.click(asSliced);
+    expect(onManualMappingChange).toHaveBeenCalledWith({ 1: -2 });
+    expect(onForceColorMatchChange).toHaveBeenCalledWith(1, true);
+  });
+
+  it('shows the "As sliced" pick as the chosen row while it is set (#3460)', async () => {
+    server.use(
+      http.get('/api/v1/printers/:id/status', () => HttpResponse.json(createStatus({}))),
+    );
+
+    render(
+      <FilamentMapping
+        printerId={1}
+        filamentReqs={mockFilamentReqs}
+        manualMappings={{ 1: -2 }}
+        onManualMappingChange={() => {}}
+        currencySymbol="$"
+        defaultCostPerKg={0}
+        defaultExpanded
+        forceColorMatch={{ 1: true }}
+        onForceColorMatchChange={() => {}}
+      />,
+    );
+
+    const trigger = await waitFor(() => screen.getAllByRole('combobox')[0]);
+    expect(trigger.textContent).toMatch(/As sliced/i);
+  });
+
+  it('reads the picker and header as waiting-as-sliced while the pick is set (#3460)', async () => {
+    // The slot is pinned to "As sliced": the picker must show the pick (not a
+    // tray, not "-- Select slot --"), the header must not claim ready, and
+    // the list must not offer "As sliced" twice (placeholder row plus option
+    // row).
+    server.use(
+      http.get('/api/v1/printers/:id/status', () => HttpResponse.json(createStatus({}))),
+    );
+
+    render(
+      <FilamentMapping
+        printerId={1}
+        filamentReqs={mockFilamentReqs}
+        manualMappings={{ 1: -2 }}
+        onManualMappingChange={() => {}}
+        currencySymbol="$"
+        defaultCostPerKg={0}
+        defaultExpanded
+        forceColorMatch={{ 1: true }}
+        onForceColorMatchChange={() => {}}
+      />,
+    );
+
+    // The picker reads as-sliced, not a tray.
+    const trigger = await waitFor(() => screen.getAllByRole('combobox')[0]);
+    expect(trigger.textContent).toMatch(/As sliced/i);
+    // The header no longer claims ready while the job will wait.
+    await waitFor(() => {
+      expect(screen.getByText(/\(Waiting for sliced color\)/i)).toBeInTheDocument();
+    });
+
+    // And the option row is not duplicated beside the placeholder row.
+    const listbox = await openSlotPicker();
+    expect(within(listbox).getAllByText(/As sliced/i)).toHaveLength(1);
+  });
+
+  it('keeps the option row offered while a tray is displayed (#3460)', async () => {
+    // The queue item was armed as-sliced but the dialog auto-matched a tray
+    // and shows it. Hiding the "As sliced" row here (as the no-tray state
+    // does) would force the user to pick another tray first just to get back
+    // to the sliced colour — the exact workaround the feature must not
+    // require. The trigger shows the tray, the placeholder is not rendered,
+    // so the option row is the only as-sliced control on screen.
+    server.use(
+      http.get(
+        '/api/v1/printers/:id/status',
+        () =>
+          HttpResponse.json(
+            createStatus({
+              fila_switch: null,
+              // AMS 0 → left nozzle, so the PETG tray (green, matching the
+              // requirement) auto-matches and the picker displays a tray.
+              ams_extruder_map: { '0': 1 },
+            }),
+          ),
+      ),
+    );
+
+    render(
+      <FilamentMapping
+        printerId={1}
+        filamentReqs={mockFilamentReqs}
+        manualMappings={{}}
+        onManualMappingChange={() => {}}
+        currencySymbol="$"
+        defaultCostPerKg={0}
+        defaultExpanded
+        forceColorMatch={{ 1: true }}
+        onForceColorMatchChange={() => {}}
+      />,
+    );
+
+    // The trigger shows the auto-matched tray, not the as-sliced label.
+    const trigger = await waitFor(() => screen.getAllByRole('combobox')[0]);
+    expect(trigger.textContent).toMatch(/Bambu PETG/);
+
+    const listbox = await openSlotPicker();
+    expect(within(listbox).getAllByText(/As sliced/i)).toHaveLength(1);
+  });
+
+  it('reads an armed-but-unpicked slot as as-sliced without duplicating the row (#3460)', async () => {
+    // Force armed, nothing picked, and the sliced colour isn't even loaded:
+    // the state IS the wait for the sliced colour (#3445 semantics), so the
+    // placeholder says so — and the option row stands down so the choice is
+    // not offered twice.
+    server.use(
+      http.get(
+        '/api/v1/printers/:id/status',
+        () =>
+          HttpResponse.json(
+            createStatus({
+              fila_switch: null,
+              // Only PLA loaded; the slot asks for PETG, so nothing auto-matches.
+              ams: [{ id: 0, tray: [{ id: 0, tray_type: 'PLA', tray_color: 'FF0000' }] }],
+            }),
+          ),
+      ),
+    );
+
+    render(
+      <FilamentMapping
+        printerId={1}
+        filamentReqs={mockFilamentReqs}
+        manualMappings={{}}
+        onManualMappingChange={() => {}}
+        currencySymbol="$"
+        defaultCostPerKg={0}
+        defaultExpanded
+        forceColorMatch={{ 1: true }}
+        onForceColorMatchChange={() => {}}
+      />,
+    );
+
+    const trigger = await waitFor(() => screen.getAllByRole('combobox')[0]);
+    expect(trigger.textContent).toMatch(/As sliced/i);
+
+    const listbox = await openSlotPicker();
+    // The swapped placeholder row is the only as-sliced row in the list.
+    expect(within(listbox).getAllByText(/As sliced/i)).toHaveLength(1);
+  });
+
+  it('keeps the option row offered while the slot is not yet the as-sliced pick', async () => {
+    server.use(
+      http.get(
+        '/api/v1/printers/:id/status',
+        () =>
+          HttpResponse.json(
+            createStatus({
+              fila_switch: null,
+              ams: [{ id: 0, tray: [{ id: 0, tray_type: 'PETG', tray_color: '00FF00' }] }],
+            }),
+          ),
+      ),
+    );
+
+    render(
+      <FilamentMapping
+        printerId={1}
+        filamentReqs={mockFilamentReqs}
+        manualMappings={{}}
+        onManualMappingChange={() => {}}
+        currencySymbol="$"
+        defaultCostPerKg={0}
+        defaultExpanded
+        forceColorMatch={{}}
+        onForceColorMatchChange={() => {}}
+      />,
+    );
+
+    const listbox = await openSlotPicker();
+    expect(within(listbox).getAllByText(/As sliced/i)).toHaveLength(1);
+  });
+
   it('offers cross-extruder slots in the dropdown without FTS (#1722)', async () => {
     // Before #1722 the dropdown filtered to only slots whose extruder matched
     // the filament's slicer-assigned nozzle. On a dual-nozzle printer with one

@@ -6,6 +6,7 @@ import { canonicalFilamentType, normalizeColorForCompare } from '../../utils/ams
 import { SlotPicker } from './SlotPicker';
 import { displayHex } from './displayHex';
 import { useFilamentLabels } from './useFilamentLabels';
+import { AS_SLICED_VALUE } from '../../hooks/useFilamentMapping';
 import type { FilamentReqsData } from './types';
 
 interface FilamentOverrideProps {
@@ -18,6 +19,10 @@ interface FilamentOverrideProps {
   forceColorMatch?: Record<number, boolean>;
   /** Called when a slot's force color match checkbox is toggled. */
   onForceColorMatchChange?: (slotId: number, value: boolean) => void;
+  /** Called when the user picks the "As sliced" row for a slot (#3460). Lets
+   *  the caller distinguish that pick from a plain force tick, which keeps
+   *  its pre-existing colour-only matching. */
+  onAsSlicedPick?: (slotId: number) => void;
   /** Names the plate these requirements belong to, when one panel is rendered per
    *  selected plate. Each plate prints its own subset of the file's slots (#2552). */
   plateLabel?: string;
@@ -38,6 +43,7 @@ export function FilamentOverride({
   onChange,
   forceColorMatch,
   onForceColorMatchChange,
+  onAsSlicedPick,
   plateLabel,
   showHint = true,
 }: FilamentOverrideProps) {
@@ -61,11 +67,25 @@ export function FilamentOverride({
   }, [availableFilaments]);
 
   const filaments = filamentReqs?.filaments;
-  if (!filaments || filaments.length === 0 || availableFilaments.length === 0) {
+  // #3460: an empty `availableFilaments` no longer hides the panel. Its rows
+  // still carry the force-colour checkbox, which is the only way to ask for
+  // "as sliced" when no printer of the model has anything loaded right now —
+  // exactly the situation where the job should wait for the colours to be.
+  if (!filaments || filaments.length === 0) {
     return null;
   }
 
   const handleChange = (slotId: number, value: string) => {
+    if (value === AS_SLICED_VALUE) {
+      // "As sliced" is the placeholder state itself: drop any override and arm
+      // the force toggle so dispatch waits for the sliced colour (#3460).
+      const next = { ...overrides };
+      delete next[slotId];
+      onChange(next);
+      onForceColorMatchChange?.(slotId, true);
+      onAsSlicedPick?.(slotId);
+      return;
+    }
     if (value === '') {
       // Reset to original
       const next = { ...overrides };
@@ -135,9 +155,21 @@ export function FilamentOverride({
                 <SlotPicker
                   value={isOverridden ? `${override.type}|${override.color}` : ''}
                   onChange={(next) => handleChange(req.slot_id, next)}
-                  placeholder={`${t('printModal.originalFilament')}: ${resolvedName} (${colorLabel})`}
+                  // When force is armed and no override is set, this slot IS the
+                  // "as sliced" pick — say so instead of the generic original
+                  // label (#3460).
+                  placeholder={
+                    (forceColorMatch?.[req.slot_id] ?? false) && !isOverridden
+                      ? t('printModal.asSliced', { name: resolvedName, color: colorLabel })
+                      : `${t('printModal.originalFilament')}: ${resolvedName} (${colorLabel})`
+                  }
                   placeholderOption={{ rgba: req.color, hex: displayHex(req.color) }}
-                  disabled={compatible.length === 0}
+                  // The picker stays usable with nothing loaded anywhere on the
+                  // model: the "As sliced" row needs no tray to be meaningful,
+                  // and it is the point of the empty-AMS case (#3460). Only a
+                  // panel with no force wiring at all has nothing left to
+                  // offer.
+                  disabled={compatible.length === 0 && !onForceColorMatchChange}
                   ariaLabel={t('printModal.overrideForFilament', { name: resolvedName })}
                   exactMatchLabel={t('printModal.exactColorMatch')}
                   className={
@@ -145,7 +177,26 @@ export function FilamentOverride({
                       ? 'border-blue-500/50 dark:border-blue-400/50 text-blue-700 dark:text-blue-400'
                       : 'border-bambu-gray/30 text-bambu-gray'
                   }
-                  options={compatible.map((f, idx) => ({
+                  options={[
+                    // #3460: the sliced file's own colour, as an explicit pick.
+                    // Selecting it clears any override and arms "Force color
+                    // match", so dispatch waits until some printer of the model
+                    // actually holds the colour. Only offered when the caller
+                    // persists force flags — without one the pick could not say
+                    // what it means — and hidden once the slot already IS the
+                    // as-sliced pick (force armed, no override), where the
+                    // placeholder row reads the same and a second row would
+                    // look like a second choice.
+                    ...(onForceColorMatchChange
+                      && !((forceColorMatch?.[req.slot_id] ?? false) && !isOverridden)
+                      ? [{
+                          value: AS_SLICED_VALUE,
+                          label: t('printModal.asSliced', { name: resolvedName, color: colorLabel }),
+                          rgba: req.color,
+                          exactMatch: true,
+                        }]
+                      : []),
+                    ...compatible.map((f, idx) => ({
                     // The value has to stay `TYPE|COLOR` -- `handleChange`
                     // parses it -- but two spools of the same type and colour
                     // on different printers collapse to one value, so the key
@@ -158,7 +209,8 @@ export function FilamentOverride({
                     exactMatch:
                       normalizeColorForCompare(req.color) !== '' &&
                       normalizeColorForCompare(f.color) === normalizeColorForCompare(req.color),
-                  }))}
+                  }))
+                ]}
                 />
                 {/* Reset button */}
                 {isOverridden ? (

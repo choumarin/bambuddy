@@ -5,6 +5,7 @@ import type { PrinterStatus, Printer } from '../api/client';
 import {
   buildLoadedFilaments,
   computeAmsMapping,
+  AS_SLICED_TRAY_ID,
   type LoadedFilament,
   type FilamentRequirement,
 } from './useFilamentMapping';
@@ -218,6 +219,13 @@ function computeMappingWithOverrides(
 
     // Check manual override first
     if (slotId > 0 && manualMappings[slotId] !== undefined) {
+      // The "As sliced" sentinel (#3460) names no tray: the slot waits for the
+      // sliced colour, so it serialises as unresolved (-1) exactly as
+      // `buildFilamentComparison` does, never as a raw tray id.
+      if (manualMappings[slotId] === AS_SLICED_TRAY_ID) {
+        comparisons.push({ slot_id: slotId, globalTrayId: -1 });
+        continue;
+      }
       comparisons.push({ slot_id: slotId, globalTrayId: manualMappings[slotId] });
       continue;
     }

@@ -87,17 +87,92 @@ describe('FilamentOverride', () => {
       expect(screen.queryByText('Filament Override')).not.toBeInTheDocument();
     });
 
-    it('returns null when availableFilaments is empty', () => {
+    it('renders with only the force toggle when availableFilaments is empty (#3460)', () => {
+      // Nothing loaded anywhere on the model used to hide the whole panel,
+      // which also hid the only way to ask for "as sliced" — the situation
+      // where waiting for the colours is the whole point. The rows now render
+      // with the disabled picker and the force-colour checkbox.
       render(
         <FilamentOverride
           filamentReqs={defaultFilamentReqs}
           availableFilaments={[]}
           overrides={{}}
           onChange={mockOnChange}
+          forceColorMatch={{}}
+          onForceColorMatchChange={() => {}}
         />
       );
 
-      expect(screen.queryByText('Filament Override')).not.toBeInTheDocument();
+      expect(screen.getByText('Filament Override')).toBeInTheDocument();
+      const checkbox = screen.getByLabelText(/Force color match/i) as HTMLInputElement;
+      expect(checkbox).toBeInTheDocument();
+      expect(checkbox.checked).toBe(false);
+    });
+
+    it('picks "As sliced" from a picker with nothing loaded anywhere (#3460)', () => {
+      // The headline case of the feature: an empty AMS on every printer of
+      // the model. The picker must stay usable, the as-sliced row be its only
+      // choice, and picking it arm the force toggle — the empty-AMS state is
+      // precisely where "wait for the colours" is the point.
+      const onForce = vi.fn();
+      render(
+        <FilamentOverride
+          filamentReqs={defaultFilamentReqs}
+          availableFilaments={[]}
+          overrides={{}}
+          onChange={mockOnChange}
+          forceColorMatch={{}}
+          onForceColorMatchChange={onForce}
+        />
+      );
+
+      const rows = openPicker(0);
+      const asSliced = rows.find((o) => o.getAttribute('data-value') === 'as-sliced');
+      expect(asSliced).toBeDefined();
+
+      fireEvent.click(asSliced!);
+      expect(mockOnChange).toHaveBeenCalledWith({});
+      expect(onForce).toHaveBeenCalledWith(1, true);
+    });
+
+    it('offers the sliced colour as an explicit pick that arms the force toggle (#3460)', () => {
+      const onForceColorMatchChange = vi.fn();
+      render(
+        <FilamentOverride
+          filamentReqs={defaultFilamentReqs}
+          availableFilaments={defaultAvailable}
+          overrides={{}}
+          onChange={mockOnChange}
+          forceColorMatch={{}}
+          onForceColorMatchChange={onForceColorMatchChange}
+        />
+      );
+
+      // The sliced colour leads the list, ahead of the loaded filaments.
+      const rows = openPicker(0);
+      expect(rows.map((o) => o.getAttribute('data-value'))[0]).toBe(''); // placeholder row stays first
+      expect(rows.map((o) => o.getAttribute('data-value'))[1]).toBe('as-sliced');
+
+      // Picking it is a no-override + force: the placeholder state is the
+      // sliced filament, and dispatch must wait for it.
+      fireEvent.click(rows.find((o) => o.getAttribute('data-value') === 'as-sliced')!);
+      expect(mockOnChange).toHaveBeenCalledWith({});
+      expect(onForceColorMatchChange).toHaveBeenCalledWith(1, true);
+    });
+
+    it('labels the empty picker as the as-sliced pick once force is armed', () => {
+      render(
+        <FilamentOverride
+          filamentReqs={defaultFilamentReqs}
+          availableFilaments={defaultAvailable}
+          overrides={{}}
+          onChange={mockOnChange}
+          forceColorMatch={{ 1: true }}
+          onForceColorMatchChange={() => {}}
+        />
+      );
+
+      expect(triggerText(0)).toMatch(/As sliced/i);
     });
 
     it('renders filament slot with type and grams', () => {
